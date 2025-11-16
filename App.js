@@ -9,13 +9,17 @@ import {
   Platform,
   Dimensions,
   ActivityIndicator,
-  SafeAreaView
+  SafeAreaView,
+  Alert,
+  Share
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { LineChart, BarChart } from 'react-native-chart-kit';
 import MapView, { Marker } from 'react-native-maps';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 
 // Import cities data
 import citiesData from './assets/data/cities.json';
@@ -50,6 +54,43 @@ export default function App() {
   const [showMap, setShowMap] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isDark, setIsDark] = useState(false);
+
+  // New features state
+  const [favorites, setFavorites] = useState([]);
+  const [comparisonCities, setComparisonCities] = useState([]);
+  const [comparisonData, setComparisonData] = useState([]);
+  const [showComparison, setShowComparison] = useState(false);
+  const [aqiData, setAqiData] = useState(null);
+  const [weatherAlerts, setWeatherAlerts] = useState([]);
+
+  // Load favorites from AsyncStorage
+  useEffect(() => {
+    const loadFavorites = async () => {
+      try {
+        const stored = await AsyncStorage.getItem('favorites');
+        if (stored) {
+          setFavorites(JSON.parse(stored));
+        }
+      } catch (err) {
+        console.error('Failed to load favorites:', err);
+      }
+    };
+    loadFavorites();
+  }, []);
+
+  // Save favorites to AsyncStorage
+  useEffect(() => {
+    const saveFavorites = async () => {
+      try {
+        await AsyncStorage.setItem('favorites', JSON.stringify(favorites));
+      } catch (err) {
+        console.error('Failed to save favorites:', err);
+      }
+    };
+    if (favorites.length > 0) {
+      saveFavorites();
+    }
+  }, [favorites]);
 
   // Initialize with first city
   useEffect(() => {
@@ -86,6 +127,36 @@ export default function App() {
           time: data.hourly.time.slice(0, timeRange),
           current: data.current_weather
         });
+
+        // Fetch Air Quality data
+        try {
+          const aqiUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${selectedCity.lat}&longitude=${selectedCity.lon}&current=european_aqi,us_aqi&hourly=pm10,pm2_5`;
+          const aqiRes = await fetch(aqiUrl);
+          if (aqiRes.ok) {
+            const aqiJson = await aqiRes.json();
+            setAqiData(aqiJson);
+          }
+        } catch (e) {
+          console.warn('Failed to fetch AQI data:', e);
+        }
+
+        // Generate weather alerts
+        const alerts = [];
+        const temp = data.current_weather?.temperature;
+        const windSpeed = data.current_weather?.windspeed;
+
+        if (temp && temp > 35) {
+          alerts.push({ type: 'heat', message: 'Extreme heat warning', severity: 'high' });
+        } else if (temp && temp < -10) {
+          alerts.push({ type: 'cold', message: 'Extreme cold warning', severity: 'high' });
+        }
+
+        if (windSpeed && windSpeed > 60) {
+          alerts.push({ type: 'wind', message: 'High wind warning', severity: 'moderate' });
+        }
+
+        setWeatherAlerts(alerts);
+
       } catch (err) {
         setError(err.toString());
       } finally {
@@ -96,6 +167,39 @@ export default function App() {
 
     fetchWeather();
   }, [selectedCity, timeRange]);
+
+  // Fetch comparison cities data
+  useEffect(() => {
+    if (!showComparison || comparisonCities.length === 0) {
+      setComparisonData([]);
+      return;
+    }
+
+    const fetchComparisonData = async () => {
+      try {
+        const promises = comparisonCities.map(async (compCity) => {
+          const vars = VARIABLE_OPTIONS.map(v => v.key).join(',');
+          const url = `${API_URL}?latitude=${compCity.lat}&longitude=${compCity.lon}&hourly=${vars}&timezone=auto&current_weather=true`;
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`Failed to fetch data for ${compCity.name}`);
+          const json = await res.json();
+
+          return {
+            city: compCity,
+            current: json.current_weather,
+            hourly: json.hourly
+          };
+        });
+
+        const results = await Promise.all(promises);
+        setComparisonData(results);
+      } catch (err) {
+        console.error('Failed to fetch comparison data:', err);
+      }
+    };
+
+    fetchComparisonData();
+  }, [comparisonCities, showComparison]);
 
   // Temperature conversion
   const convertTemp = (temp) => {
@@ -155,6 +259,122 @@ export default function App() {
     };
   };
 
+  // Handler functions
+  const toggleFavorite = () => {
+    if (!selectedCity) return;
+
+    const isFavorite = favorites.some(f => f.name === selectedCity.name);
+    if (isFavorite) {
+      setFavorites(prev => prev.filter(f => f.name !== selectedCity.name));
+    } else {
+      setFavorites(prev => [...prev, selectedCity]);
+    }
+  };
+
+  const addCityToComparison = (city) => {
+    if (comparisonCities.length >= 3) {
+      Alert.alert('Limit Reached', 'You can only compare up to 3 cities at once.');
+      return;
+    }
+    if (comparisonCities.some(c => c.name === city.name)) {
+      return;
+    }
+    setComparisonCities(prev => [...prev, city]);
+  };
+
+  const removeCityFromComparison = (index) => {
+    setComparisonCities(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const exportToCSV = async () => {
+    if (!weatherData) return;
+
+    const headers = ['Time', ...selectedVariables.map(v => VARIABLE_OPTIONS.find(opt => opt.key === v)?.label || v)];
+    const rows = weatherData.time.map((time, i) => {
+      const row = [new Date(time).toLocaleString()];
+      selectedVariables.forEach(varKey => {
+        row.push(weatherData.hourly[varKey]?.[i] || '');
+      });
+      return row.join(',');
+    });
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    const fileUri = FileSystem.documentDirectory + `weather_${selectedCity.name}_${Date.now()}.csv`;
+
+    try {
+      await FileSystem.writeAsStringAsync(fileUri, csv);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri);
+      } else {
+        Alert.alert('Success', 'CSV file created');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Failed to export CSV: ' + error.message);
+    }
+  };
+
+  const exportToJSON = async () => {
+    if (!weatherData) return;
+
+    const jsonData = {
+      city: selectedCity.name,
+      exportTime: new Date().toISOString(),
+      timeRange: timeRange,
+      data: {
+        time: weatherData.time,
+        hourly: weatherData.hourly,
+        current: weatherData.current
+      }
+    };
+
+    const json = JSON.stringify(jsonData, null, 2);
+    const fileUri = FileSystem.documentDirectory + `weather_${selectedCity.name}_${Date.now()}.json`;
+
+    try {
+      await FileSystem.writeAsStringAsync(fileUri, json);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri);
+      } else {
+        Alert.alert('Success', 'JSON file created');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Failed to export JSON: ' + error.message);
+    }
+  };
+
+  const shareWeather = async () => {
+    if (!selectedCity || !weatherData?.current) return;
+
+    const message = `Weather in ${selectedCity.name}:\n` +
+      `Temperature: ${formatTemp(weatherData.current.temperature)}\n` +
+      `Wind: ${formatSpeed(weatherData.current.windspeed)}\n` +
+      `Direction: ${weatherData.current.winddirection}°`;
+
+    try {
+      if (Platform.OS === 'web') {
+        if (navigator.share) {
+          await navigator.share({ title: 'Weather Dashboard', text: message });
+        } else {
+          Alert.alert('Weather Info', message);
+        }
+      } else {
+        await Share.share({ message });
+      }
+    } catch (error) {
+      console.error('Share failed:', error);
+    }
+  };
+
+  const getAQIDescription = (aqi) => {
+    if (!aqi) return 'Unknown';
+    if (aqi <= 50) return 'Good';
+    if (aqi <= 100) return 'Moderate';
+    if (aqi <= 150) return 'Unhealthy for Sensitive Groups';
+    if (aqi <= 200) return 'Unhealthy';
+    if (aqi <= 300) return 'Very Unhealthy';
+    return 'Hazardous';
+  };
+
   // Filtered cities for search
   const filteredCities = searchQuery
     ? cities.filter(c => c.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -162,6 +382,7 @@ export default function App() {
 
   const screenWidth = Dimensions.get('window').width;
   const theme = isDark ? darkTheme : lightTheme;
+  const isFavorite = selectedCity && favorites.some(f => f.name === selectedCity.name);
 
   return (
     <SafeAreaView style={[styles.safeArea, { backgroundColor: theme.background }]}>
@@ -181,7 +402,12 @@ export default function App() {
         {/* Current Weather */}
         {weatherData?.current && (
           <View style={[styles.currentWeather, { backgroundColor: theme.card }]}>
-            <Text style={[styles.cityName, { color: theme.text }]}>{selectedCity?.name}</Text>
+            <View style={styles.cityHeader}>
+              <Text style={[styles.cityName, { color: theme.text }]}>{selectedCity?.name}</Text>
+              <TouchableOpacity onPress={toggleFavorite} style={styles.favoriteButton}>
+                <Text style={styles.favoriteIcon}>{isFavorite ? '⭐' : '☆'}</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={[styles.temperature, { color: theme.text }]}>
               {formatTemp(weatherData.current.temperature)}
             </Text>
@@ -191,6 +417,64 @@ export default function App() {
             <Text style={[styles.weatherDetail, { color: theme.textSecondary }]}>
               Direction: {weatherData.current.winddirection}°
             </Text>
+
+            {/* Action Buttons */}
+            <View style={styles.actionButtons}>
+              <TouchableOpacity onPress={shareWeather} style={[styles.actionButton, { backgroundColor: '#3B82F6' }]}>
+                <Text style={styles.actionButtonText}>📤 Share</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={exportToCSV} style={[styles.actionButton, { backgroundColor: '#10B981' }]}>
+                <Text style={styles.actionButtonText}>📊 CSV</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={exportToJSON} style={[styles.actionButton, { backgroundColor: '#8B5CF6' }]}>
+                <Text style={styles.actionButtonText}>📋 JSON</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Weather Alerts */}
+        {weatherAlerts.length > 0 && (
+          <View style={[styles.section, { backgroundColor: '#FEE2E2' }]}>
+            <Text style={[styles.sectionTitle, { color: '#DC2626' }]}>⚠️ Weather Alerts</Text>
+            {weatherAlerts.map((alert, idx) => (
+              <View key={idx} style={styles.alertItem}>
+                <Text style={[styles.alertText, { color: '#991B1B' }]}>
+                  {alert.severity === 'high' ? '🔴' : '🟡'} {alert.message}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* Air Quality Index */}
+        {aqiData?.current && (
+          <View style={[styles.section, { backgroundColor: theme.card }]}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>🌫️ Air Quality</Text>
+            <Text style={[styles.aqiText, { color: theme.text }]}>
+              US AQI: {aqiData.current.us_aqi} - {getAQIDescription(aqiData.current.us_aqi)}
+            </Text>
+            <Text style={[styles.aqiText, { color: theme.text }]}>
+              EU AQI: {aqiData.current.european_aqi} - {getAQIDescription(aqiData.current.european_aqi)}
+            </Text>
+          </View>
+        )}
+
+        {/* Favorites */}
+        {favorites.length > 0 && (
+          <View style={[styles.section, { backgroundColor: theme.card }]}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>⭐ Favorites</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {favorites.map(fav => (
+                <TouchableOpacity
+                  key={fav.name}
+                  onPress={() => setSelectedCity(fav)}
+                  style={[styles.cityChip, { backgroundColor: '#FCD34D' }]}
+                >
+                  <Text style={[styles.cityChipText, { color: '#78350F' }]}>{fav.name}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
           </View>
         )}
 
@@ -339,6 +623,81 @@ export default function App() {
               </TouchableOpacity>
             ))}
           </View>
+        </View>
+
+        {/* City Comparison */}
+        <View style={[styles.section, { backgroundColor: theme.card }]}>
+          <View style={styles.comparisonHeader}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>Compare Cities</Text>
+            <TouchableOpacity
+              onPress={() => setShowComparison(!showComparison)}
+              style={[styles.button, { backgroundColor: showComparison ? '#3B82F6' : theme.chipBackground, marginBottom: 0 }]}
+            >
+              <Text style={[styles.buttonText, { color: showComparison ? '#fff' : theme.text }]}>
+                {showComparison ? '✓ On' : 'Enable'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          {showComparison && (
+            <View style={styles.comparisonContent}>
+              <Text style={[styles.comparisonInfo, { color: theme.textSecondary }]}>
+                Select up to 3 cities to compare side-by-side
+              </Text>
+
+              {/* Selected comparison cities */}
+              <View style={styles.comparisonCities}>
+                {comparisonCities.map((city, idx) => (
+                  <View key={idx} style={[styles.comparisonCityChip, { backgroundColor: '#3B82F6' }]}>
+                    <Text style={styles.comparisonCityText}>{city.name}</Text>
+                    <TouchableOpacity onPress={() => removeCityFromComparison(idx)}>
+                      <Text style={styles.removeComparisonText}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </View>
+
+              {/* Add city button */}
+              {comparisonCities.length < 3 && selectedCity && (
+                <TouchableOpacity
+                  onPress={() => addCityToComparison(selectedCity)}
+                  style={[styles.addComparisonButton, { backgroundColor: '#10B981' }]}
+                >
+                  <Text style={styles.addComparisonText}>+ Add {selectedCity.name}</Text>
+                </TouchableOpacity>
+              )}
+
+              {/* Comparison table */}
+              {comparisonData.length > 0 && (
+                <ScrollView horizontal showsHorizontalScrollIndicator={true} style={styles.comparisonTable}>
+                  <View>
+                    <View style={styles.comparisonRow}>
+                      <Text style={[styles.comparisonCell, styles.comparisonHeader, { color: theme.text }]}>City</Text>
+                      {comparisonData.map((item, idx) => (
+                        <Text key={idx} style={[styles.comparisonCell, { color: theme.text }]}>{item.city.name}</Text>
+                      ))}
+                    </View>
+                    <View style={styles.comparisonRow}>
+                      <Text style={[styles.comparisonCell, styles.comparisonHeader, { color: theme.text }]}>Temp</Text>
+                      {comparisonData.map((item, idx) => (
+                        <Text key={idx} style={[styles.comparisonCell, { color: theme.text }]}>
+                          {formatTemp(item.current.temperature)}
+                        </Text>
+                      ))}
+                    </View>
+                    <View style={styles.comparisonRow}>
+                      <Text style={[styles.comparisonCell, styles.comparisonHeader, { color: theme.text }]}>Wind</Text>
+                      {comparisonData.map((item, idx) => (
+                        <Text key={idx} style={[styles.comparisonCell, { color: theme.text }]}>
+                          {formatSpeed(item.current.windspeed)}
+                        </Text>
+                      ))}
+                    </View>
+                  </View>
+                </ScrollView>
+              )}
+            </View>
+          )}
         </View>
 
         {/* Chart */}
@@ -622,5 +981,107 @@ const styles = StyleSheet.create({
   },
   chart: {
     borderRadius: 16,
+  },
+  cityHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+  },
+  favoriteButton: {
+    padding: 8,
+  },
+  favoriteIcon: {
+    fontSize: 28,
+  },
+  actionButtons: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 16,
+  },
+  actionButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  actionButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  alertItem: {
+    paddingVertical: 8,
+  },
+  alertText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  aqiText: {
+    fontSize: 14,
+    marginVertical: 4,
+  },
+  comparisonHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  comparisonContent: {
+    marginTop: 8,
+  },
+  comparisonInfo: {
+    fontSize: 12,
+    marginBottom: 12,
+  },
+  comparisonCities: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  comparisonCityChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    gap: 6,
+  },
+  comparisonCityText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  removeComparisonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  addComparisonButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  addComparisonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  comparisonTable: {
+    marginTop: 8,
+  },
+  comparisonRow: {
+    flexDirection: 'row',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E7EB',
+  },
+  comparisonCell: {
+    padding: 12,
+    minWidth: 100,
+    fontSize: 14,
   },
 });
