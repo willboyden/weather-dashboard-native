@@ -168,7 +168,7 @@ export default function App() {
     fetchWeather();
   }, [selectedCity, timeRange]);
 
-  // Fetch comparison cities data
+  // Fetch comparison cities data - update when timeRange or selectedVariables change
   useEffect(() => {
     if (!showComparison || comparisonCities.length === 0) {
       setComparisonData([]);
@@ -199,7 +199,7 @@ export default function App() {
     };
 
     fetchComparisonData();
-  }, [comparisonCities, showComparison]);
+  }, [comparisonCities, showComparison, timeRange, selectedVariables]);
 
   // Temperature conversion
   const convertTemp = (temp) => {
