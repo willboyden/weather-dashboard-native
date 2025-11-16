@@ -225,13 +225,34 @@ export default function App() {
     return `${Math.round(converted)} ${isMetric ? 'km/h' : 'mph'}`;
   };
 
-  // Prepare chart data
+  // Prepare chart data with dynamic labels based on time range
   const getChartData = () => {
     if (!weatherData) return null;
 
-    const labels = weatherData.time.map(t => {
+    // Format labels based on time range
+    const labels = weatherData.time.map((t, index) => {
       const date = new Date(t);
-      return `${date.getHours()}:00`;
+
+      if (timeRange <= 24) {
+        // For 24 hours or less, show just time
+        return `${date.getHours().toString().padStart(2, '0')}:00`;
+      } else if (timeRange <= 72) {
+        // For 2-3 days, show day + time
+        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        return `${days[date.getDay()]} ${date.getHours()}h`;
+      } else if (timeRange <= 168) {
+        // For up to a week, show date + time (but only every few hours to reduce clutter)
+        if (index % 3 === 0) {
+          return `${date.getMonth() + 1}/${date.getDate()} ${date.getHours()}h`;
+        }
+        return '';
+      } else {
+        // For multi-week, show date only (sample every 6 hours)
+        if (index % 6 === 0) {
+          return `${date.getMonth() + 1}/${date.getDate()}`;
+        }
+        return '';
+      }
     });
 
     const datasets = selectedVariables.map(varKey => {
@@ -253,8 +274,12 @@ export default function App() {
       };
     }).filter(Boolean);
 
+    // Filter labels intelligently based on time range
+    const labelSkip = timeRange <= 24 ? 2 : timeRange <= 72 ? 4 : timeRange <= 168 ? 6 : 8;
+    const filteredLabels = labels.filter((_, i) => i % labelSkip === 0 || labels[i] !== '');
+
     return {
-      labels: labels.filter((_, i) => i % Math.ceil(timeRange / 12) === 0),
+      labels: filteredLabels,
       datasets
     };
   };
@@ -540,14 +565,19 @@ export default function App() {
                 longitudeDelta: 10,
               }}
             >
-              {cities.slice(0, 50).map(city => (
-                <Marker
-                  key={city.name}
-                  coordinate={{ latitude: city.lat, longitude: city.lon }}
-                  title={city.name}
-                  onPress={() => setSelectedCity(city)}
-                />
-              ))}
+              {cities.slice(0, 50).map(city => {
+                const isSelected = city.name === selectedCity?.name;
+                return (
+                  <Marker
+                    key={city.name}
+                    coordinate={{ latitude: city.lat, longitude: city.lon }}
+                    title={city.name}
+                    description={isSelected ? 'Currently Selected' : ''}
+                    pinColor={isSelected ? '#3B82F6' : '#6B7280'}
+                    onPress={() => setSelectedCity(city)}
+                  />
+                );
+              })}
             </MapView>
           </View>
         )}
@@ -715,12 +745,27 @@ export default function App() {
 
         {!loading && !error && weatherData && getChartData() && (
           <View style={[styles.chartContainer, { backgroundColor: theme.card }]}>
-            <Text style={[styles.chartTitle, { color: theme.text }]}>Weather Forecast</Text>
+            <Text style={[styles.chartTitle, { color: theme.text }]}>
+              {selectedCity?.name || 'Weather'} - {(() => {
+                const days = Math.floor(timeRange / 24);
+                const hours = timeRange % 24;
+                if (days > 0 && hours > 0) return `${days}d ${hours}h Forecast`;
+                if (days > 0) return `${days} day${days > 1 ? 's' : ''} Forecast`;
+                return `${hours} hour${hours > 1 ? 's' : ''} Forecast`;
+              })()}
+            </Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={true}>
               <LineChart
                 data={getChartData()}
                 width={Math.max(screenWidth - 32, timeRange * 20)}
-                height={220}
+                height={(() => {
+                  const { width, height } = Dimensions.get('window');
+                  const isLandscape = width > height;
+                  // Landscape: shorter chart to fit on screen
+                  if (isLandscape && width < 900) return 180;
+                  // Portrait: taller for better readability
+                  return 220;
+                })()}
                 chartConfig={{
                   backgroundColor: theme.card,
                   backgroundGradientFrom: theme.card,
